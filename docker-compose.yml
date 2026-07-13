@@ -1,19 +1,31 @@
 services:
   whatsapp_go:
+    container_name: whatsapp-web
+    image: aldinokemal2104/go-whatsapp-web-multidevice
+    # Alternatif: build sendiri dari source (hapus baris image di atas, aktifkan blok ini)
+    # build:
+    #   context: .
+    #   dockerfile: ./docker/golang.Dockerfile
+    command: ["rest"]
+    restart: unless-stopped
     logging:
       driver: "json-file"
       options:
         max-size: "200k"
         max-file: "10"
-    build:
-      context: .
-      dockerfile: ./docker/golang.Dockerfile
-    restart: "on-failure"
-    ports:
-      - "3000:3000"
     env_file:
       - src/.env
     volumes:
       # Persist WhatsApp + chat DBs; entrypoint chowns for gowauser (uid 20001, gid 20000) on start.
       - ./storages:/app/storages
       - ./statics:/app/statics
+    networks:
+      - proxy-network
+    # SENGAJA tanpa "ports:" -> aplikasi TIDAK diekspos ke internet.
+    # Akses hanya lewat Nginx Proxy Manager yang menjangkau container ini
+    # secara internal di proxy-network (forward ke whatsapp-web:3000).
+    # Jangan tambahkan "ports: - 3000:3000" / "5002:3000" -> itu membuka port ke publik lagi.
+
+networks:
+  proxy-network:
+    external: true   # network milik stack Nginx Proxy Manager (dibuat di luar compose ini)
