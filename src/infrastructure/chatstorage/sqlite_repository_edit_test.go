@@ -3,6 +3,7 @@ package chatstorage
 import (
 	"context"
 	"database/sql"
+	"os"
 	"testing"
 	"time"
 
@@ -104,7 +105,7 @@ func (suite *SQLiteRepositoryEditTestSuite) TestCreateMessageStoresEditHistoryAn
 			require.NotNil(t, got)
 			assert.Equal(t, tc.editedContent, got.Content)
 
-			rows, err := suite.db.Query(`
+			rows, err := suite.repo.db.Query(`
 				SELECT original_message_id, edit_event_id, previous_content, new_content
 				FROM message_edits
 				WHERE original_message_id = ?
@@ -142,6 +143,10 @@ func TestSQLiteRepositoryEditTestSuite(t *testing.T) {
 
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+
+	if os.Getenv("CHATSTORAGE_TEST_PG_URI") != "" {
+		return newTestSQLiteRepository(t).db.DB
+	}
 
 	db, err := sql.Open("sqlite3", ":memory:")
 	if err != nil {

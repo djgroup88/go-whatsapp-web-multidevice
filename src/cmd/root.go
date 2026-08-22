@@ -144,6 +144,9 @@ func initEnvConfig() {
 	if envDBKEYSURI := viper.GetString("db_keys_uri"); envDBKEYSURI != "" {
 		config.DBKeysURI = envDBKEYSURI
 	}
+	if envChatStorageURI := viper.GetString("chat_storage_uri"); envChatStorageURI != "" {
+		config.ChatStorageURI = envChatStorageURI
+	}
 	if viper.IsSet("chat_storage_max_open_conns") {
 		if n := viper.GetInt("chat_storage_max_open_conns"); n > 0 {
 			config.ChatStorageMaxOpenConns = n
@@ -401,6 +404,12 @@ func initFlags() {
 		`the database uri to store the connection data database uri (by default, we'll use sqlite3 under storages/whatsapp.db). database uri --db-uri <string> | example: --db-uri="file:storages/whatsapp.db?_foreign_keys=on or postgres://user:password@localhost:5432/whatsapp"`,
 	)
 	rootCmd.PersistentFlags().StringVarP(
+		&config.ChatStorageURI,
+		"chat-storage-uri", "",
+		config.ChatStorageURI,
+		`the database uri for chat storage (chats, messages, reactions, chatwoot links). Defaults to sqlite3 under storages/chatstorage.db | example: --chat-storage-uri="file:storages/chatstorage.db" or --chat-storage-uri="postgres://user:password@localhost:5432/whatsapp?sslmode=disable"`,
+	)
+	rootCmd.PersistentFlags().StringVarP(
 		&config.DBKeysURI,
 		"db-keys-uri", "",
 		config.DBKeysURI,
@@ -629,9 +638,19 @@ func initFlags() {
 }
 
 func initChatStorage() (*sql.DB, error) {
-	connStr := sqlite.FormatChatStorageURI(config.ChatStorageURI, config.ChatStorageEnableWAL, config.ChatStorageEnableForeignKeys)
-
-	db, err := sql.Open(sqlite.DriverName, connStr)
+	var (
+		db  *sql.DB
+		err error
+	)
+	switch {
+	case strings.HasPrefix(config.ChatStorageURI, "postgres:"), strings.HasPrefix(config.ChatStorageURI, "postgresql:"):
+		db, err = sql.Open("postgres", config.ChatStorageURI)
+	case strings.HasPrefix(config.ChatStorageURI, "file:"):
+		connStr := sqlite.FormatChatStorageURI(config.ChatStorageURI, config.ChatStorageEnableWAL, config.ChatStorageEnableForeignKeys)
+		db, err = sql.Open(sqlite.DriverName, connStr)
+	default:
+		return nil, fmt.Errorf("unknown chat storage uri %q: only sqlite3 (file:) and postgres are supported", config.ChatStorageURI)
+	}
 	if err != nil {
 		return nil, err
 	}

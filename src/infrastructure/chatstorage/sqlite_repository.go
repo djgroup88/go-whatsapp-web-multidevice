@@ -19,12 +19,18 @@ import (
 
 // SQLiteRepository implements Repository using SQLite
 type SQLiteRepository struct {
-	db *sql.DB
+	db *dbConn
 }
 
-// NewSQLiteRepository creates a new SQLite repository
+// NewStorageRepository creates a chat storage repository. The SQL dialect
+// (SQLite or Postgres) is detected from the driver behind db.
 func NewStorageRepository(db *sql.DB) domainChatStorage.IChatStorageRepository {
-	return &SQLiteRepository{db: db}
+	return NewStorageRepositoryWithDialect(db, detectDialect(db))
+}
+
+// NewStorageRepositoryWithDialect creates a chat storage repository for an explicit dialect.
+func NewStorageRepositoryWithDialect(db *sql.DB, dialect Dialect) domainChatStorage.IChatStorageRepository {
+	return &SQLiteRepository{db: newDBConn(db, dialect)}
 }
 
 // StoreChat creates or updates a chat
@@ -162,7 +168,7 @@ func (r *SQLiteRepository) GetMessageEdits(originalMessageID, deviceID string) (
 // Returns the query fragment (starting from JOIN/WHERE), conditions, and args.
 func (r *SQLiteRepository) buildChatFilterQuery(filter *domainChatStorage.ChatFilter) (joinClause string, conditions []string, args []any) {
 	if filter.SearchName != "" {
-		conditions = append(conditions, "c.name LIKE ?")
+		conditions = append(conditions, "c.name "+r.db.caseInsensitiveLike()+" ?")
 		args = append(args, "%"+filter.SearchName+"%")
 	}
 
@@ -856,7 +862,7 @@ func (r *SQLiteRepository) GetLatestUnreadChatwootMessageLinkByChat(deviceID, wa
 			chatwoot_contact_inbox_source_id, source_id, direction,
 			is_read, created_at, updated_at, chatwoot_config_id, chatwoot_account_id
 		FROM chatwoot_message_links
-		WHERE device_id = ? AND wa_chat_jid = ? AND direction = 'incoming' AND is_read = 0
+		WHERE device_id = ? AND wa_chat_jid = ? AND direction = 'incoming' AND is_read = FALSE
 		ORDER BY updated_at DESC, created_at DESC
 		LIMIT 1
 	`
@@ -1055,14 +1061,22 @@ func (r *SQLiteRepository) SaveChatwootDeviceConfig(cfg *domainChatStorage.Chatw
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
-		res, err := r.db.Exec(`
+		insertSQL := `
 			INSERT INTO chatwoot_device_configs (
 				device_id, device_jid, chatwoot_url, account_id, inbox_id,
 				api_token, enabled, created_at, updated_at
 			)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		`, cfg.DeviceID, cfg.DeviceJID, cfg.ChatwootURL, cfg.AccountID, cfg.InboxID,
-			cfg.APIToken, cfg.Enabled, cfg.CreatedAt, cfg.UpdatedAt)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		insertArgs := []any{cfg.DeviceID, cfg.DeviceJID, cfg.ChatwootURL, cfg.AccountID, cfg.InboxID,
+			cfg.APIToken, cfg.Enabled, cfg.CreatedAt, cfg.UpdatedAt}
+		if r.db.dialect == DialectPostgres {
+			// lib/pq does not support LastInsertId; use RETURNING instead.
+			if err := r.db.QueryRow(insertSQL+" RETURNING id", insertArgs...).Scan(&cfg.ID); err != nil {
+				return err
+			}
+			return nil
+		}
+		res, err := r.db.Exec(insertSQL, insertArgs...)
 		if err != nil {
 			return err
 		}
@@ -1165,7 +1179,7 @@ func (r *SQLiteRepository) GetChatwootDeviceConfigByIdentifier(identifier string
 // fails-fast instead of routing an agent reply to the wrong WhatsApp account.
 func (r *SQLiteRepository) GetChatwootDeviceConfigByInbox(accountID, inboxID int) (*domainChatStorage.ChatwootDeviceConfig, error) {
 	rows, err := r.db.Query(
-		"SELECT "+chatwootDeviceConfigColumns+" FROM chatwoot_device_configs WHERE account_id = ? AND inbox_id = ? AND enabled = 1",
+		"SELECT "+chatwootDeviceConfigColumns+" FROM chatwoot_device_configs WHERE account_id = ? AND inbox_id = ? AND enabled = TRUE",
 		accountID, inboxID)
 	if err != nil {
 		return nil, err
@@ -2329,7 +2343,7 @@ func (r *SQLiteRepository) runMigration(migration string, version int) error {
 	defer tx.Rollback()
 
 	// Execute migration (single statement)
-	if _, err := tx.Exec(migration); err != nil {
+	if _, err := tx.Exec(translateDDL(r.db.dialect, migration)); err != nil {
 		return err
 	}
 

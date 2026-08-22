@@ -4,16 +4,37 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
+	_ "github.com/lib/pq"
 )
 
+// newTestSQLiteRepository returns a fresh repository. By default it is backed
+// by a temp SQLite file; set CHATSTORAGE_TEST_PG_URI to a Postgres DSN to run
+// the same suite against Postgres (the public schema is reset per test).
 func newTestSQLiteRepository(t *testing.T) *SQLiteRepository {
 	t.Helper()
+
+	if pgURI := os.Getenv("CHATSTORAGE_TEST_PG_URI"); pgURI != "" {
+		db, err := sql.Open("postgres", pgURI)
+		if err != nil {
+			t.Fatalf("open postgres database: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		if _, err := db.Exec("DROP SCHEMA public CASCADE; CREATE SCHEMA public"); err != nil {
+			t.Fatalf("reset postgres schema: %v", err)
+		}
+		repo := &SQLiteRepository{db: newDBConn(db, DialectPostgres)}
+		if err := repo.InitializeSchema(); err != nil {
+			t.Fatalf("initialize schema: %v", err)
+		}
+		return repo
+	}
 
 	db, err := sql.Open(sqlite.DriverName, filepath.Join(t.TempDir(), "chatstorage.db"))
 	if err != nil {
@@ -21,14 +42,22 @@ func newTestSQLiteRepository(t *testing.T) *SQLiteRepository {
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
-	repo := &SQLiteRepository{db: db}
+	repo := &SQLiteRepository{db: newDBConn(db, DialectSQLite)}
 	if err := repo.InitializeSchema(); err != nil {
 		t.Fatalf("initialize schema: %v", err)
 	}
 	return repo
 }
 
+func skipIfPostgres(t *testing.T) {
+	t.Helper()
+	if os.Getenv("CHATSTORAGE_TEST_PG_URI") != "" {
+		t.Skip("SQLite-specific test")
+	}
+}
+
 func TestSQLiteRepositoryInitializesMessageReactionsSchema(t *testing.T) {
+	skipIfPostgres(t)
 	repo := newTestSQLiteRepository(t)
 
 	var tableName string
