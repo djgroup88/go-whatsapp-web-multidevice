@@ -637,7 +637,9 @@ func getAudioDuration(audioPath string) uint32 {
 		return 0
 	}
 
-	return uint32(duration)
+	// Round up: a 0.9s voice note must be 1s, never 0 — clients refuse
+	// to play a PTT whose Seconds is zero.
+	return uint32(math.Ceil(duration))
 }
 
 // generateWaveform generates a waveform visualization for voice notes using ffmpeg.
@@ -1182,6 +1184,11 @@ func (service serviceSend) SendAudio(ctx context.Context, request domainSend.Aud
 		audioMimeType = "audio/ogg; codecs=opus"
 	}
 
+	// A PTT with Seconds=0 renders but refuses to play on phones.
+	if request.PTT && audioDuration == 0 {
+		audioDuration = 1
+	}
+
 	// Generate waveform for PTT voice notes
 	var waveformData []byte
 	if request.PTT && tempAudioPath != "" {
@@ -1232,14 +1239,34 @@ func (service serviceSend) SendAudio(ctx context.Context, request domainSend.Aud
 			convCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
 
-			cmdConvert := exec.CommandContext(convCtx, "ffmpeg",
+			// Decode to PCM first: encoding straight from a compressed source
+			// makes ffmpeg fold the decoder/resampler delay into the Opus
+			// pre-skip (start_time ~0.08s) — and WhatsApp players refuse to
+			// play such a voice note. A WAV intermediate keeps the header
+			// clean (start_time 0), which is what the clients accept.
+			wavPath := filepath.Join(absBaseDir, fmt.Sprintf("audio_pcm_%s.wav", generateUUID))
+			deletedItems = append(deletedItems, wavPath)
+
+			cmdDecode := exec.CommandContext(convCtx, "ffmpeg",
 				"-i", inputPath,
+				"-ar", "48000",
+				"-ac", "1",
+				"-y",
+				wavPath,
+			)
+			var stderrDecode bytes.Buffer
+			cmdDecode.Stderr = &stderrDecode
+			if err := cmdDecode.Run(); err != nil {
+				logrus.Errorf("ffmpeg PCM decode failed: %v, stderr: %s", err, stderrDecode.String())
+				return response, pkgError.InternalServerError(fmt.Sprintf("failed to decode audio for PTT conversion: %v", err))
+			}
+
+			cmdConvert := exec.CommandContext(convCtx, "ffmpeg",
+				"-i", wavPath,
 				"-c:a", "libopus",
 				"-b:a", "64k",
 				"-vbr", "on",
 				"-application", "voip",
-				"-ar", "48000",
-				"-ac", "1",
 				"-y", // Overwrite output if exists
 				outputPath,
 			)
@@ -1262,6 +1289,12 @@ func (service serviceSend) SendAudio(ctx context.Context, request domainSend.Aud
 			audioMimeType = "audio/ogg; codecs=opus"
 
 			logrus.Infof("Converted audio to OGG Opus for PTT: %d bytes", len(audioBytes))
+
+			// The converted file carries real duration metadata even when the
+			// input (e.g. a fragmented MP4 from a browser MediaRecorder) does not.
+			if converted := getAudioDuration(outputPath); converted > 0 {
+				audioDuration = converted
+			}
 		} else {
 			// Already OGG format, ensure MIME type is correctly set
 			audioMimeType = "audio/ogg; codecs=opus"
