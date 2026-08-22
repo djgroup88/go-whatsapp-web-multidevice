@@ -268,10 +268,13 @@ func ValidateSendVideo(ctx context.Context, request domainSend.VideoRequest) err
 			"video/x-matroska": true,
 			"video/avi":        true,
 			"video/x-msvideo":  true,
+			// GIF is accepted and converted to MP4 by the usecase - WhatsApp has
+			// no GIF message type; a "GIF" is an MP4 with GifPlayback set.
+			"image/gif":        true,
 		}
 
 		if !availableMimes[request.Video.Header.Get("Content-Type")] {
-			return pkgError.ValidationError("your video type is not allowed. please use mp4/mkv/avi/x-msvideo")
+			return pkgError.ValidationError("your video type is not allowed. please use mp4/mkv/avi/x-msvideo/gif")
 		}
 
 		if request.Video.Size > config.WhatsappSettingMaxVideoSize { // 30MB

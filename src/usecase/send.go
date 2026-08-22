@@ -792,9 +792,40 @@ func (service serviceSend) SendVideo(ctx context.Context, request domainSend.Vid
 		return response, pkgError.InternalServerError("ffmpeg not installed")
 	}
 
+	// GIF sources are converted to MP4 first: WhatsApp's wire protocol has no
+	// GIF message type - a "GIF" is an MP4 video with GifPlayback set, which
+	// is also what the official clients do to every .gif they send.
+	wasGif := strings.EqualFold(filepath.Ext(oriVideoPath), ".gif")
+	if wasGif {
+		convertedPath := fmt.Sprintf("%s/%s", config.PathSendItems, generateUUID+"_gif.mp4")
+		cmdGif := exec.Command("ffmpeg",
+			"-i", oriVideoPath,
+			"-movflags", "faststart",
+			"-pix_fmt", "yuv420p",
+			// h264 requires even dimensions; GIFs are often odd-sized
+			"-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+			"-an",
+			"-y",
+			convertedPath,
+		)
+		var stderrGif bytes.Buffer
+		cmdGif.Stderr = &stderrGif
+		if errGif := cmdGif.Run(); errGif != nil {
+			logrus.Errorf("ffmpeg GIF->MP4 conversion failed: %v, stderr: %s", errGif, stderrGif.String())
+			return response, pkgError.InternalServerError(fmt.Sprintf("failed to convert GIF to MP4: %v", errGif))
+		}
+		deletedItems = append(deletedItems, oriVideoPath)
+		oriVideoPath = convertedPath
+	}
+
 	// Generate thumbnail using ffmpeg
 	thumbnailVideoPath := fmt.Sprintf("%s/%s", config.PathSendItems, generateUUID+".png")
-	cmdThumbnail := exec.Command("ffmpeg", "-i", oriVideoPath, "-ss", "00:00:01.000", "-vframes", "1", thumbnailVideoPath)
+	thumbSeek := "00:00:01.000"
+	if wasGif {
+		// many GIFs loop in under a second - frame 0 always exists
+		thumbSeek = "00:00:00.000"
+	}
+	cmdThumbnail := exec.Command("ffmpeg", "-i", oriVideoPath, "-ss", thumbSeek, "-vframes", "1", thumbnailVideoPath)
 	err = cmdThumbnail.Run()
 	if err != nil {
 		return response, pkgError.InternalServerError(fmt.Sprintf("failed to create thumbnail %v", err))
