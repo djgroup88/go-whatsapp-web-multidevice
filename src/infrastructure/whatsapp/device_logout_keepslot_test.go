@@ -26,6 +26,17 @@ type keepSlotStubStorage struct {
 	savedRecords   []*domainChatStorage.DeviceRecord
 	deletedData    []string
 	deletedRecords []string
+	rekeyed        [][2]string
+	record         *domainChatStorage.DeviceRecord
+}
+
+func (s *keepSlotStubStorage) RekeyDeviceData(oldID, newID string) error {
+	s.rekeyed = append(s.rekeyed, [2]string{oldID, newID})
+	return nil
+}
+
+func (s *keepSlotStubStorage) GetDeviceRecord(string) (*domainChatStorage.DeviceRecord, error) {
+	return s.record, nil
 }
 
 func (s *keepSlotStubStorage) SaveDeviceRecord(rec *domainChatStorage.DeviceRecord) error {
@@ -147,11 +158,38 @@ func TestPurgeDevice_DeletesStoreRowsByJIDAcrossPrimaryAndKeys(t *testing.T) {
 	if _, ok := manager.GetDevice(slotID); ok {
 		t.Fatal("expected slot to be removed after purge")
 	}
-	if len(storage.deletedData) == 0 || storage.deletedData[0] != slotID {
-		t.Fatalf("expected chatstorage data deletion for %s, got %v", slotID, storage.deletedData)
+	// Chat rows are partitioned by the bare JID while paired, so the purge must sweep
+	// both the slot id and the JID partition.
+	if len(storage.deletedData) != 2 || storage.deletedData[0] != slotID || storage.deletedData[1] != nonAD {
+		t.Fatalf("expected chatstorage data deletion for [%s %s], got %v", slotID, nonAD, storage.deletedData)
 	}
 	if len(storage.deletedRecords) == 0 || storage.deletedRecords[0] != slotID {
 		t.Fatalf("expected device record deletion for %s, got %v", slotID, storage.deletedRecords)
+	}
+}
+
+// A slot that was logged out and then deleted has no in-memory JID any more; purge
+// must still reach the JID partition recorded in the persisted registry row (the
+// production case where DELETE left 79 chats / 2435 messages behind).
+func TestPurgeDevice_SweepsJIDPartitionFromPersistedRecord(t *testing.T) {
+	ctx := context.Background()
+	storage := &keepSlotStubStorage{record: &domainChatStorage.DeviceRecord{DeviceID: "slot-uuid-3", JID: "19406198361@s.whatsapp.net", ADJID: "19406198361:14@s.whatsapp.net"}}
+	manager := NewDeviceManager(newTestSQLStore(t), nil, storage)
+	manager.devices["slot-uuid-3"] = &DeviceInstance{id: "slot-uuid-3", createdAt: time.Now()}
+
+	if err := manager.PurgeDevice(ctx, "slot-uuid-3"); err != nil {
+		t.Fatalf("PurgeDevice returned error: %v", err)
+	}
+	want := []string{"slot-uuid-3", "19406198361@s.whatsapp.net"}
+	if len(storage.deletedData) != len(want) || storage.deletedData[0] != want[0] || storage.deletedData[1] != want[1] {
+		t.Fatalf("expected deletion keys %v, got %v", want, storage.deletedData)
+	}
+}
+
+func TestChatStorageKeys_DedupesAndStripsADSuffix(t *testing.T) {
+	got := chatStorageKeys([]string{"slot", "", "628111:5@s.whatsapp.net", "628111@s.whatsapp.net", " slot "})
+	if len(got) != 2 || got[0] != "slot" || got[1] != "628111@s.whatsapp.net" {
+		t.Fatalf("unexpected keys: %v", got)
 	}
 }
 

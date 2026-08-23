@@ -1350,6 +1350,98 @@ func (r *SQLiteRepository) DeleteDeviceData(deviceID string) error {
 	return tx.Commit()
 }
 
+// RekeyDeviceData moves every chat-partitioned row from oldID to newID. Rows whose
+// primary key already exists under newID are left in place and the stale copy under
+// oldID is deleted, so the move never violates a primary key. message_edits carries a
+// foreign key to messages(id, chat_jid, device_id) that is checked per statement, so
+// those rows are staged in a temp table, dropped, and re-inserted after messages move.
+func (r *SQLiteRepository) RekeyDeviceData(oldID, newID string) error {
+	oldID = strings.TrimSpace(oldID)
+	newID = strings.TrimSpace(newID)
+	if oldID == "" || newID == "" || oldID == newID {
+		return nil
+	}
+
+	tx, err := r.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Drop rows under oldID whose primary key already exists under newID.
+	dropDup := func(table string, keys ...string) error {
+		cond := make([]string, 0, len(keys))
+		for _, k := range keys {
+			cond = append(cond, fmt.Sprintf("t2.%s = %s.%s", k, table, k))
+		}
+		q := fmt.Sprintf("DELETE FROM %s WHERE device_id = ? AND EXISTS (SELECT 1 FROM %s t2 WHERE t2.device_id = ? AND %s)",
+			table, table, strings.Join(cond, " AND "))
+		if _, err := tx.Exec(q, oldID, newID); err != nil {
+			return fmt.Errorf("failed to drop duplicate %s rows: %w", table, err)
+		}
+		return nil
+	}
+	rekey := func(table string) error {
+		if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET device_id = ? WHERE device_id = ?", table), newID, oldID); err != nil {
+			return fmt.Errorf("failed to rekey %s: %w", table, err)
+		}
+		return nil
+	}
+
+	// Stage message_edits (FK to messages) before touching messages.
+	if err := dropDup("message_edits", "original_message_id", "edit_event_id"); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("DROP TABLE IF EXISTS tmp_rekey_message_edits"); err != nil {
+		return fmt.Errorf("failed to reset edits staging table: %w", err)
+	}
+	if _, err := tx.Exec(`CREATE TEMPORARY TABLE tmp_rekey_message_edits AS
+		SELECT original_message_id, edit_event_id, chat_jid, editor, previous_content, new_content, edited_at, created_at
+		FROM message_edits WHERE device_id = ?`, oldID); err != nil {
+		return fmt.Errorf("failed to stage message edits: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM message_edits WHERE device_id = ?", oldID); err != nil {
+		return fmt.Errorf("failed to detach message edits: %w", err)
+	}
+
+	if err := dropDup("message_reactions", "message_id", "reactor_jid"); err != nil {
+		return err
+	}
+	if err := rekey("message_reactions"); err != nil {
+		return err
+	}
+	if err := dropDup("chatwoot_message_links", "wa_message_id"); err != nil {
+		return err
+	}
+	if err := rekey("chatwoot_message_links"); err != nil {
+		return err
+	}
+	if err := dropDup("messages", "id", "chat_jid"); err != nil {
+		return err
+	}
+	if err := rekey("messages"); err != nil {
+		return err
+	}
+	if err := dropDup("chats", "jid"); err != nil {
+		return err
+	}
+	if err := rekey("chats"); err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`INSERT INTO message_edits
+		(original_message_id, edit_event_id, chat_jid, device_id, editor, previous_content, new_content, edited_at, created_at)
+		SELECT original_message_id, edit_event_id, chat_jid, ?, editor, previous_content, new_content, edited_at, created_at
+		FROM tmp_rekey_message_edits`, newID); err != nil {
+		return fmt.Errorf("failed to reattach message edits: %w", err)
+	}
+	if _, err := tx.Exec("DROP TABLE tmp_rekey_message_edits"); err != nil {
+		return fmt.Errorf("failed to drop edits staging table: %w", err)
+	}
+
+	return tx.Commit()
+}
+
 // SaveDeviceRecord upserts a device registration for persistence across restarts.
 func (r *SQLiteRepository) SaveDeviceRecord(record *domainChatStorage.DeviceRecord) error {
 	if record == nil || strings.TrimSpace(record.DeviceID) == "" {

@@ -94,6 +94,13 @@ type IChatStorageRepository interface {
 	TruncateAllChats() error
 	TruncateAllDataWithLogging(logPrefix string) error
 	DeleteDeviceData(deviceID string) error
+	// RekeyDeviceData re-partitions chat data (chats, messages, reactions, edits,
+	// Chatwoot message links) from one device_id key to another. The partition key
+	// of a slot is its bare JID while paired and its slot id while logged out, so
+	// logout/login hand the rows over instead of orphaning them. Rows that already
+	// exist under newID win; the duplicate rows under oldID are dropped. No-op when
+	// either id is empty or both are equal.
+	RekeyDeviceData(oldID, newID string) error
 
 	// Device registry operations
 	SaveDeviceRecord(record *DeviceRecord) error

@@ -297,6 +297,13 @@ func (r *deviceChatStorage) DeleteDeviceData(deviceID string) error {
 	return r.base.DeleteDeviceData(target)
 }
 
+func (r *deviceChatStorage) RekeyDeviceData(oldID, newID string) error {
+	if r.base == nil {
+		return nil
+	}
+	return r.base.RekeyDeviceData(oldID, newID)
+}
+
 func (r *deviceChatStorage) SaveDeviceRecord(record *domainChatStorage.DeviceRecord) error {
 	return r.base.SaveDeviceRecord(record)
 }

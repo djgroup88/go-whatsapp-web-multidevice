@@ -259,6 +259,29 @@ func (m *DeviceManager) deleteStoreRowsForJID(ctx context.Context, jid string) e
 	return firstErr
 }
 
+// chatStorageKeys normalises a list of candidate chat-storage partition keys: blanks
+// dropped, AD JIDs reduced to their bare number (the partition key never carries the
+// :NN suffix), duplicates removed, order preserved.
+func chatStorageKeys(candidates []string) []string {
+	seen := make(map[string]struct{}, len(candidates))
+	keys := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if parsed, err := types.ParseJID(c); err == nil && parsed.User != "" {
+			c = parsed.ToNonAD().String()
+		}
+		if _, dup := seen[c]; dup {
+			continue
+		}
+		seen[c] = struct{}{}
+		keys = append(keys, c)
+	}
+	return keys
+}
+
 // PurgeDevice cleanly logs out a device, removes its persisted records (store/keys),
 // deletes its chatstorage data, and removes it from the in-memory registry.
 func (m *DeviceManager) PurgeDevice(ctx context.Context, deviceID string) error {
@@ -275,9 +298,15 @@ func (m *DeviceManager) PurgeDevice(ctx context.Context, deviceID string) error 
 
 	// Resolve the device's WhatsApp identity before tearing anything down so we can
 	// delete its whatsmeow store rows even when no live client is attached.
+	//
+	// Chat data is partitioned by the slot's bare JID while it is paired and by the
+	// slot id while logged out, so purge must sweep every key the slot ever used —
+	// in-memory identity, the persisted registry record, and the raw slot id.
 	var jid string
+	chatKeys := []string{deviceID}
 	if inst, ok := m.GetDevice(deviceID); ok && inst != nil {
 		jid = storeIdentity(inst)
+		chatKeys = append(chatKeys, inst.JID(), inst.ADJID())
 		if cli := inst.GetClient(); cli != nil {
 			// The WhatsApp unlink is best-effort: a dead/expired session may fail
 			// here, but that must not block local cleanup or fail the purge.
@@ -290,9 +319,17 @@ func (m *DeviceManager) PurgeDevice(ctx context.Context, deviceID string) error 
 
 	// Delete chatstorage data for this device (local cleanup — surfaced on failure).
 	if m.storage != nil {
-		if err := m.storage.DeleteDeviceData(deviceID); err != nil {
-			logrus.WithError(err).Warnf("[DEVICE_MANAGER] failed to delete chatstorage for device %s", deviceID)
+		if rec, err := m.storage.GetDeviceRecord(deviceID); err != nil {
+			logrus.WithError(err).Warnf("[DEVICE_MANAGER] failed to load device record for %s", deviceID)
 			recordErr(err)
+		} else if rec != nil {
+			chatKeys = append(chatKeys, rec.JID, rec.ADJID)
+		}
+		for _, key := range chatStorageKeys(chatKeys) {
+			if err := m.storage.DeleteDeviceData(key); err != nil {
+				logrus.WithError(err).Warnf("[DEVICE_MANAGER] failed to delete chatstorage for device %s (key %s)", deviceID, key)
+				recordErr(err)
+			}
 		}
 
 		// Drop the device's Chatwoot config (and its message links) with it. An
@@ -395,6 +432,10 @@ func (m *DeviceManager) keepSlotLogout(ctx context.Context, deviceID string) err
 
 	var firstErr error
 	firstErr = errors.Join(firstErr, m.deleteStoreRowsForJID(ctx, jid))
+	// The chat partition key switches from the bare JID to the slot id once the JID is
+	// cleared; move the rows along so the slot keeps its history and a later purge
+	// (or re-pair under the same id) can still find them.
+	firstErr = errors.Join(firstErr, m.rekeyChatStorage(inst.JID(), deviceID))
 	firstErr = errors.Join(firstErr, m.resetDeviceKeepSlot(deviceID))
 	return firstErr
 }
@@ -590,7 +631,25 @@ func (m *DeviceManager) applyStoreJID(instance *DeviceInstance, storeJID types.J
 	instance.jid = nonAD
 	instance.adJID = storeJID.String()
 	instance.mu.Unlock()
+	// History written while the slot was logged out lives under the slot id; fold it
+	// into the JID partition that is now authoritative.
+	if err := m.rekeyChatStorage(instance.ID(), nonAD); err != nil {
+		logrus.WithError(err).Warnf("[DEVICE_MANAGER] failed to move chat history of slot %s to %s", instance.ID(), nonAD)
+	}
 	instance.SetChatStorage(newDeviceChatStorage(nonAD, m.storage))
+}
+
+// rekeyChatStorage moves chat-partitioned rows between partition keys. No-op without
+// storage, with a blank key, or when both keys resolve to the same partition.
+func (m *DeviceManager) rekeyChatStorage(oldKey, newKey string) error {
+	if m.storage == nil {
+		return nil
+	}
+	keys := chatStorageKeys([]string{oldKey, newKey})
+	if len(keys) != 2 {
+		return nil
+	}
+	return m.storage.RekeyDeviceData(keys[0], keys[1])
 }
 
 // persistInstanceRecord upserts the slot's registry record from its in-memory state.
