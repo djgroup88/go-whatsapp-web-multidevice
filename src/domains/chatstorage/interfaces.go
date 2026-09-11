@@ -104,6 +104,11 @@ type IChatStorageRepository interface {
 
 	// Device registry operations
 	SaveDeviceRecord(record *DeviceRecord) error
+	// SaveReachoutTimelock persists WhatsApp's account-wide restriction on starting
+	// new chats (error 463); endsAtUnix 0 clears it.
+	SaveReachoutTimelock(deviceID, enforcementType string, endsAtUnix int64) error
+	// GetReachoutTimelock reads back that restriction; zero means none in force.
+	GetReachoutTimelock(deviceID string) (enforcementType string, endsAtUnix int64, err error)
 	ListDeviceRecords() ([]*DeviceRecord, error)
 	GetDeviceRecord(deviceID string) (*DeviceRecord, error)
 	// GetDeviceRecordByJID fetches a device record by its JID. A full AD JID resolves

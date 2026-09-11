@@ -66,6 +66,17 @@ var (
 	WhatsappPresencePulseInterval              = 24 * time.Hour
 	WhatsappPresencePulseDuration              = 5 * time.Minute
 
+	// WhatsappColdSendInterval is the minimum spacing between sends to contacts
+	// this account holds no trusted-contact token for (a "cold reach-out" — the
+	// case WhatsApp rejects with error 463). Bursts of those are what escalate a
+	// single 463 into an account-wide reach-out timelock. Sends inside existing
+	// conversations are never delayed. Set to 0 to disable the pacing.
+	WhatsappColdSendInterval = 5 * time.Second
+	// WhatsappColdSendMaxWait caps how long a request may be held waiting for a
+	// cold-send slot; past it the send is rejected so the caller backs off
+	// instead of the HTTP request hanging.
+	WhatsappColdSendMaxWait = 30 * time.Second
+
 	// WhatsappProxy is forwarded to whatsmeow's *Client.SetProxyAddress before
 	// Connect. Accepts SOCKS5/HTTP/HTTPS schemes, e.g.
 	// "socks5://user:pass@host:1080" or "http://host:8080". Empty = direct

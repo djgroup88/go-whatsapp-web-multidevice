@@ -3,8 +3,11 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
@@ -13,6 +16,8 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/store"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -317,5 +322,224 @@ func TestSendForwardUnsupportedType(t *testing.T) {
 	}
 	if genericErr.Error() != utils.ErrUnsupportedForwardType {
 		t.Fatalf("error = %q, want %q", genericErr.Error(), utils.ErrUnsupportedForwardType)
+	}
+}
+
+func TestNormalizeSendErrorSurfacesServerCode(t *testing.T) {
+	err := normalizeSendError(fmt.Errorf("failed to send message node: %w 426", whatsmeow.ErrServerReturnedError))
+
+	genericErr, ok := err.(pkgError.GenericError)
+	if !ok {
+		t.Fatalf("expected generic error, got %T", err)
+	}
+	if got := genericErr.ErrCode(); got != "WA_SERVER_ERROR_426" {
+		t.Fatalf("expected WA_SERVER_ERROR_426, got %q", got)
+	}
+	if got := genericErr.StatusCode(); got != http.StatusBadGateway {
+		t.Fatalf("expected status %d, got %d", http.StatusBadGateway, got)
+	}
+	if !errors.Is(err, whatsmeow.ErrServerReturnedError) {
+		t.Fatal("wrapped error must still unwrap to the whatsmeow sentinel")
+	}
+	// A failure that is not a server nack must pass through untouched.
+	plain := errors.New("dial tcp: connection refused")
+	if got := normalizeSendError(plain); got != plain {
+		t.Fatalf("non-server error was rewritten: %v", got)
+	}
+}
+
+// preflightCtx builds a device context whose client has no privacy token store,
+// so every recipient reads as cold — the case the endpoint exists to report.
+func preflightCtx(deviceID string) context.Context {
+	// The device key is the account JID, so each test needs its own account.
+	accountJID := types.NewJID(deviceID, types.DefaultUserServer)
+	client := &whatsmeow.Client{Store: &store.Device{ID: &accountJID}}
+	return whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance(deviceID, client, nil))
+}
+
+func TestPreflightReportsColdRecipient(t *testing.T) {
+	service := serviceSend{}
+	ctx := preflightCtx("6280000000001")
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6281111111111"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.Warm {
+		t.Fatal("recipient without a stored token must read as cold")
+	}
+	if !got.Sendable {
+		t.Fatalf("a cold recipient is still worth attempting, got sendable=false: %s", got.Reason)
+	}
+	if got.JID != "6281111111111@s.whatsapp.net" {
+		t.Fatalf("unexpected JID: %s", got.JID)
+	}
+}
+
+func TestPreflightReportsRecipientCooldown(t *testing.T) {
+	service := serviceSend{}
+	ctx := preflightCtx("6280000000002")
+	recipient := types.NewJID("6282222222222", types.DefaultUserServer)
+
+	whatsapp.MarkReachoutTimelocked(ctx, recipient)
+	defer whatsapp.ClearReachoutTimelock(ctx, recipient)
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6282222222222"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.Sendable {
+		t.Fatal("a recipient in cooldown must not be reported as sendable")
+	}
+	if got.CooldownSeconds <= 0 {
+		t.Fatalf("expected a remaining cooldown, got %d", got.CooldownSeconds)
+	}
+}
+
+// timelockRepo stubs only the reach-out timelock read; everything else is unused
+// by Preflight.
+type timelockRepo struct {
+	domainChatStorage.IChatStorageRepository
+	endsAtUnix int64
+}
+
+func (r *timelockRepo) GetReachoutTimelock(string) (string, int64, error) {
+	return "", r.endsAtUnix, nil
+}
+
+func TestPreflightReportsAccountTimelock(t *testing.T) {
+	endsAt := time.Now().Add(2 * time.Hour).Truncate(time.Second)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: endsAt.Unix()}}
+	ctx := preflightCtx("6280000000003")
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6283333333333"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.Sendable {
+		t.Fatal("no cold send is sendable while the account is timelocked")
+	}
+	if got.AccountTimelockEndsAt == nil || !got.AccountTimelockEndsAt.Equal(endsAt) {
+		t.Fatalf("expected the timelock end time to be reported, got %v", got.AccountTimelockEndsAt)
+	}
+}
+
+func TestPreflightIgnoresExpiredAccountTimelock(t *testing.T) {
+	// WhatsApp does not always announce that a lock lifted, so a past end time
+	// must read as no restriction rather than blocking sends forever.
+	expired := time.Now().Add(-time.Minute)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: expired.Unix()}}
+	ctx := preflightCtx("6280000000005")
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6283333333334"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if !got.Sendable || got.AccountTimelockEndsAt != nil {
+		t.Fatalf("expired timelock must not gate sends: %+v", got)
+	}
+}
+
+func TestPreflightSkipsGroups(t *testing.T) {
+	// A group is not a reach-out, so even an active account timelock is irrelevant.
+	endsAt := time.Now().Add(time.Hour)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: endsAt.Unix()}}
+	ctx := preflightCtx("6280000000004")
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "120363000000000000@g.us"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if !got.Sendable || got.AccountTimelockEndsAt != nil {
+		t.Fatalf("group send must not be gated by the reach-out timelock: %+v", got)
+	}
+}
+
+func TestPreflightReportsTimelockAlongsideCooldown(t *testing.T) {
+	// The account-wide lock is the root cause; a per-recipient cooldown must not
+	// hide it, or the operator retries other numbers and keeps digging.
+	endsAt := time.Now().Add(3 * time.Hour).Truncate(time.Second)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: endsAt.Unix()}}
+	ctx := preflightCtx("6280000000006")
+	recipient := types.NewJID("6284444444444", types.DefaultUserServer)
+
+	whatsapp.MarkReachoutTimelocked(ctx, recipient)
+	defer whatsapp.ClearReachoutTimelock(ctx, recipient)
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6284444444444"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.CooldownSeconds <= 0 {
+		t.Fatal("the recipient cooldown must still be reported")
+	}
+	if got.AccountTimelockEndsAt == nil || !got.AccountTimelockEndsAt.Equal(endsAt) {
+		t.Fatalf("the account timelock must be reported too, got %v", got.AccountTimelockEndsAt)
+	}
+	if !strings.Contains(got.Reason, "whole account") {
+		t.Fatalf("reason should name the account-wide restriction, got: %s", got.Reason)
+	}
+}
+
+func TestPreflightWithoutPhoneAnswersAboutTheDevice(t *testing.T) {
+	endsAt := time.Now().Add(4 * time.Hour).Truncate(time.Second)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: endsAt.Unix()}}
+
+	got, err := service.Preflight(preflightCtx("6280000000007"), domainSend.PreflightRequest{})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.Scope != "device" {
+		t.Fatalf("Scope = %q, want device", got.Scope)
+	}
+	if got.Sendable {
+		t.Fatal("a timelocked account cannot start new chats")
+	}
+	if got.AccountTimelockEndsAt == nil || !got.AccountTimelockEndsAt.Equal(endsAt) {
+		t.Fatalf("timelock end time not reported: %v", got.AccountTimelockEndsAt)
+	}
+	// Recipient-only fields must stay empty so a caller cannot read them as facts.
+	if got.Phone != "" || got.JID != "" || got.Warm || got.CooldownSeconds != 0 {
+		t.Fatalf("recipient fields leaked into a device-scoped answer: %+v", got)
+	}
+}
+
+func TestPreflightWithoutPhoneWhenAccountIsFree(t *testing.T) {
+	service := serviceSend{chatStorageRepo: &timelockRepo{}}
+
+	got, err := service.Preflight(preflightCtx("6280000000008"), domainSend.PreflightRequest{})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if !got.Sendable || got.AccountTimelockEndsAt != nil {
+		t.Fatalf("an unrestricted account must read as sendable: %+v", got)
+	}
+	if got.Scope != "device" {
+		t.Fatalf("Scope = %q, want device", got.Scope)
+	}
+}
+
+func TestPreflightReportsTimelockEvenForWarmRecipient(t *testing.T) {
+	// One refresh of a contact must also tell the caller the account's state, or a
+	// client is forced into a second request per contact just to learn it.
+	endsAt := time.Now().Add(time.Hour).Truncate(time.Second)
+	service := serviceSend{chatStorageRepo: &timelockRepo{endsAtUnix: endsAt.Unix()}}
+	ctx := preflightCtx("6280000000009")
+	recipient := types.NewJID("6285555555555", types.DefaultUserServer)
+
+	// Warm contacts are unaffected by the restriction, so it must not block them.
+	whatsapp.MarkReachoutTimelocked(ctx, recipient)
+	whatsapp.ClearReachoutTimelock(ctx, recipient)
+
+	got, err := service.Preflight(ctx, domainSend.PreflightRequest{Phone: "6285555555555"})
+	if err != nil {
+		t.Fatalf("Preflight() error = %v", err)
+	}
+	if got.AccountTimelockEndsAt == nil || !got.AccountTimelockEndsAt.Equal(endsAt) {
+		t.Fatalf("account timelock must always be reported, got %v", got.AccountTimelockEndsAt)
+	}
+	// Cold recipient on the same account is the one that is blocked.
+	if got.Warm && !got.Sendable {
+		t.Fatal("a warm recipient stays sendable while the account is timelocked")
 	}
 }

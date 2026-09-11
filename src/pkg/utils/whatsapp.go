@@ -970,15 +970,30 @@ func ValidateJidWithLogin(client *whatsmeow.Client, jid string) (types.JID, erro
 	return parsedJID, nil
 }
 
-// MustLogin ensures the WhatsApp client is logged in
+// MustLogin ensures the WhatsApp client is logged in.
+//
+// All three failures answer with the same envelope (INVALID_WA_CLI, 503): they
+// are one condition to a caller — this device cannot send — with one remedy, and
+// a 401 here blamed the caller's credentials for a session that is gone on our
+// side. A 5xx also lets a retrying client heal the transient case (a device still
+// reconnecting) instead of giving up on what looks like an auth failure.
 func MustLogin(client *whatsmeow.Client) {
 	if client == nil {
-		panic(pkgError.InternalServerError("Whatsapp client is not initialized"))
+		panic(pkgError.ErrWaCLI)
+	}
+	// No stored ID means there is no session to reconnect to: the device was never
+	// linked, or was logged out from the phone. Checked before IsConnected because
+	// such a device is also disconnected, and reporting it as "reconnecting, safe
+	// to retry" would send a retrying client into a loop that can never succeed —
+	// only a new QR scan fixes it.
+	if client.Store == nil || client.Store.ID == nil {
+		panic(pkgError.ErrWaNotLoggedIn)
 	}
 	if !client.IsConnected() {
-		panic(pkgError.ErrNotConnected)
-	} else if !client.IsLoggedIn() {
-		panic(pkgError.ErrNotLoggedIn)
+		panic(pkgError.ErrWaNotConnected)
+	}
+	if !client.IsLoggedIn() {
+		panic(pkgError.ErrWaNotLoggedIn)
 	}
 }
 

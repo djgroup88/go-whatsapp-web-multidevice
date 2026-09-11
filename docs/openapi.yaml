@@ -1898,6 +1898,103 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorInternalServer'
+  /send/preflight:
+    get:
+      operationId: sendPreflight
+      tags:
+        - send
+      summary: Check whether a number can be messaged
+      description: |
+        Reports whether a send to the given number is expected to be accepted by WhatsApp,
+        without sending anything. Answered from local session state only, so it costs
+        nothing against the account and may be called before every send.
+
+        The decisive field is `warm`: true means this session holds a trusted-contact token
+        for the recipient, which is what lets a message through WhatsApp's restriction on
+        starting new chats. A cold recipient is the case WhatsApp rejects with error 463.
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+        - name: phone
+          in: query
+          required: false
+          schema:
+            type: string
+            example: '6289685024051'
+          description: >-
+            Phone number with country code, or a full JID. Optional: omit it to ask
+            only about the device (`scope: device`), which answers whether the account
+            is under a reach-out restriction and until when. Useful to a caller that
+            has no phone number to hand.
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    example: SUCCESS
+                  message:
+                    type: string
+                    description: Same text as results.reason
+                  results:
+                    type: object
+                    properties:
+                      scope:
+                        type: string
+                        enum: [recipient, device]
+                        description: >-
+                          "recipient" when a phone was given, "device" when it was not.
+                          On a device-scoped answer `warm`, `phone`, `jid` and
+                          `cooldown_seconds` carry no meaning and stay empty.
+                        example: recipient
+                      phone:
+                        type: string
+                        example: '6289685024051'
+                      jid:
+                        type: string
+                        example: '6289685024051@s.whatsapp.net'
+                      warm:
+                        type: boolean
+                        description: A trusted-contact token for this recipient is stored in this session
+                        example: false
+                      token_received_at:
+                        type: string
+                        format: date-time
+                        description: When the trusted-contact token arrived (warm recipients only)
+                      sendable:
+                        type: boolean
+                        description: False when a send right now is expected to fail or be refused locally
+                        example: true
+                      reason:
+                        type: string
+                        example: 'No prior conversation with this number. The send may still go through, but this is the case WhatsApp can reject with error 463.'
+                      cooldown_seconds:
+                        type: integer
+                        description: Seconds this recipient stays refused locally after a recent 463 rejection
+                        example: 0
+                      queue_wait_seconds:
+                        type: integer
+                        description: Seconds a cold send would currently wait for a pacing slot
+                        example: 0
+                      account_timelock_ends_at:
+                        type: string
+                        format: date-time
+                        description: Set while WhatsApp has restricted this whole account from starting new chats
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '500':
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
   /message/{message_id}/revoke:
     post:
       operationId: revokeMessage
@@ -4715,6 +4812,35 @@ components:
         results:
           type: string
           example: null
+    ErrorDeviceSessionUnavailable:
+      type: object
+      description: |
+        The addressed device has no usable WhatsApp session, so nothing can be sent
+        from it. Returned as HTTP 503 whenever the device exists but is not linked,
+        was logged out from the phone, or is still connecting after a restart. An
+        unknown device id never reaches this: the device middleware answers 404
+        DEVICE_NOT_FOUND first.
+
+        All three causes deliberately share one `code` and one status — to a client
+        they are one condition with one remedy (link the device, or send from
+        another one). Branch on `code`, never on `message`: only the prose
+        distinguishes the three, and it is written for humans reading logs.
+
+        Being 5xx, it is safe for a retrying client to treat as transient; the
+        "still connecting" case usually heals within seconds, while the logged-out
+        case needs someone to scan the QR at GET /app/devices/{device_id}/login.
+      properties:
+        code:
+          type: string
+          example: INVALID_WA_CLI
+          description: 'Always INVALID_WA_CLI for every device-session failure'
+        message:
+          type: string
+          example: 'This device is connected to WhatsApp but has no logged-in session: it was never linked, or it was logged out from the phone. Link it again via GET /app/devices/{device_id}/login and scan the QR.'
+          description: 'Which of the three causes it was, for humans; do not branch on this'
+        results:
+          type: object
+          nullable: true
     ErrorInternalServer:
       type: object
       properties:

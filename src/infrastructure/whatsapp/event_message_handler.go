@@ -33,6 +33,15 @@ func handleMessage(ctx context.Context, evt *events.Message, chatStorageRepo dom
 	// decryption fails.
 	evt = materializeSecretEditMessage(ctx, evt, client)
 
+	// An inbound message is what lifts a reach-out timelock for this contact
+	// (it is how their trusted-contact token reaches us), so drop any local
+	// cooldown. Both JID forms are cleared because a send may have been keyed
+	// on the phone number while the message arrives from the LID, or vice versa.
+	if !evt.Info.IsFromMe {
+		ClearReachoutTimelock(ctx, evt.Info.Chat)
+		ClearReachoutTimelock(ctx, evt.Info.Sender)
+	}
+
 	if isReactionMessage(evt) {
 		if err := chatStorageRepo.CreateReaction(ctx, evt); err != nil {
 			log.Errorf("Failed to store incoming reaction %s: %v", evt.Info.ID, err)

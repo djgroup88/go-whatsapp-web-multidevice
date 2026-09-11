@@ -37,8 +37,15 @@ type IForwardSender interface {
 	SendForward(ctx context.Context, request ForwardRequest) (response GenericResponse, err error)
 }
 
+// IPreflightChecker reports whether a recipient can be messaged before anything
+// is actually sent.
+type IPreflightChecker interface {
+	Preflight(ctx context.Context, request PreflightRequest) (response PreflightResponse, err error)
+}
+
 // ISendUsecase combines all sender interfaces for backward compatibility
 type ISendUsecase interface {
+	IPreflightChecker
 	ITextSender
 	IMediaSender
 	IInteractionSender

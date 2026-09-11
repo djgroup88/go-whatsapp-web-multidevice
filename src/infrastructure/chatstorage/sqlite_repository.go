@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -1473,6 +1474,36 @@ func (r *SQLiteRepository) SaveDeviceRecord(record *domainChatStorage.DeviceReco
 	return err
 }
 
+// SaveReachoutTimelock records WhatsApp's account-wide restriction on starting
+// new chats for a device. Passing an empty type and zero endsAt clears it.
+// The row is the device's own, so the value is dropped with the device.
+func (r *SQLiteRepository) SaveReachoutTimelock(deviceID, enforcementType string, endsAtUnix int64) error {
+	if strings.TrimSpace(deviceID) == "" {
+		return fmt.Errorf("device id is required")
+	}
+	_, err := r.db.Exec(`
+		UPDATE devices SET reachout_timelock_type = ?, reachout_timelock_ends_at = ?, updated_at = ?
+		WHERE device_id = ?
+	`, enforcementType, endsAtUnix, time.Now(), deviceID)
+	return err
+}
+
+// GetReachoutTimelock returns the stored restriction for a device. A device with
+// no row, or one that was never restricted, reads as zero.
+func (r *SQLiteRepository) GetReachoutTimelock(deviceID string) (enforcementType string, endsAtUnix int64, err error) {
+	if strings.TrimSpace(deviceID) == "" {
+		return "", 0, nil
+	}
+	err = r.db.QueryRow(`
+		SELECT COALESCE(reachout_timelock_type, ''), COALESCE(reachout_timelock_ends_at, 0)
+		FROM devices WHERE device_id = ?
+	`, deviceID).Scan(&enforcementType, &endsAtUnix)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, nil
+	}
+	return enforcementType, endsAtUnix, err
+}
+
 // ListDeviceRecords returns all registered devices.
 func (r *SQLiteRepository) ListDeviceRecords() ([]*domainChatStorage.DeviceRecord, error) {
 	rows, err := r.db.Query(`
@@ -2669,5 +2700,10 @@ func (r *SQLiteRepository) getMigrations() []string {
 		`CREATE INDEX IF NOT EXISTS idx_chatwoot_links_conversation_account ON chatwoot_message_links(chatwoot_conversation_id, chatwoot_account_id, updated_at)`,
 		// Migration 43: Count/delete message links by owning config without a full-table scan
 		`CREATE INDEX IF NOT EXISTS idx_chatwoot_links_config ON chatwoot_message_links(chatwoot_config_id)`,
+		// Migration 44: WhatsApp's account-wide reach-out timelock (error 463), so the
+		// restriction survives a restart instead of being forgotten until the next event
+		`ALTER TABLE devices ADD COLUMN reachout_timelock_type VARCHAR(255) DEFAULT ''`,
+		// Migration 45: Unix seconds the timelock ends; 0 means no restriction in force
+		`ALTER TABLE devices ADD COLUMN reachout_timelock_ends_at BIGINT NOT NULL DEFAULT 0`,
 	}
 }

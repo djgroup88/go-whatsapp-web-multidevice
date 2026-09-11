@@ -270,7 +270,7 @@ func ValidateSendVideo(ctx context.Context, request domainSend.VideoRequest) err
 			"video/x-msvideo":  true,
 			// GIF is accepted and converted to MP4 by the usecase - WhatsApp has
 			// no GIF message type; a "GIF" is an MP4 with GifPlayback set.
-			"image/gif":        true,
+			"image/gif": true,
 		}
 
 		if !availableMimes[request.Video.Header.Get("Content-Type")] {

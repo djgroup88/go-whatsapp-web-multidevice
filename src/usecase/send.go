@@ -53,10 +53,51 @@ func NewSendService(appService app.IAppUsecase, chatStorageRepo domainChatStorag
 // wrapSendMessage sends the message and stores it asynchronously on success.
 // whatsmeow handles the trusted-contact (tctoken) lifecycle internally; a 463
 // "reach-out timelock" rejection is a WhatsApp server-side restriction that the
-// client cannot retry around, so it is surfaced as-is via normalizeSendError.
+// client cannot retry around, so it is surfaced as-is via normalizeSendError and
+// the recipient is put on a local cooldown so a retrying caller stops feeding
+// rejected reachouts to WhatsApp (that is what turns a timelock into a ban).
 func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, content string) (whatsmeow.SendResponse, error) {
+	if remaining := whatsapp.ReachoutCooldownRemaining(ctx, recipient); remaining > 0 {
+		logrus.Warnf("Refusing send to %s: reach-out timelock cooldown, %s remaining", recipient.String(), remaining.Round(time.Second))
+		return whatsmeow.SendResponse{}, pkgError.ErrWaReachoutTimelock
+	}
+
+	// A recipient this account holds no trusted-contact token for is a cold
+	// reach-out: the send WhatsApp may answer with 463. Those are paced so a
+	// burst cannot escalate into an account-wide timelock. Sends inside an
+	// existing conversation carry a token and are never delayed.
+	cold := whatsapp.IsColdReachoutTarget(recipient) && !whatsapp.HasTrustedContactToken(ctx, client, recipient)
+	if cold {
+		wait, ok := whatsapp.ReserveColdSendSlot(whatsapp.DeviceKeyFromContext(ctx), config.WhatsappColdSendInterval, config.WhatsappColdSendMaxWait)
+		if !ok {
+			logrus.Warnf("Rejecting cold send to %s: cold-send queue is %s deep", recipient.String(), wait.Round(time.Second))
+			return whatsmeow.SendResponse{}, pkgError.ErrWaColdSendBacklog
+		}
+		if wait > 0 {
+			logrus.Infof("Pacing cold send to %s (no prior conversation): waiting %s", recipient.String(), wait.Round(time.Millisecond))
+			timer := time.NewTimer(wait)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return whatsmeow.SendResponse{}, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+
 	ts, err := client.SendMessage(ctx, recipient, msg)
 	if err != nil {
+		// Every server nack is logged with its code and the cold/warm verdict.
+		// The codes come straight from WhatsApp, so without this line an API
+		// client only sees a bare number with no way to tell whether the
+		// recipient was known to this session at all.
+		if code, isServerErr := whatsapp.ServerErrorCode(err); isServerErr {
+			logrus.Warnf("WhatsApp rejected send to %s with server error %d, contact was %s",
+				recipient.String(), code, map[bool]string{true: "cold (no trusted-contact token)", false: "warm (token present)"}[cold])
+		}
+		if whatsapp.IsReachoutTimelockError(err) {
+			whatsapp.MarkReachoutTimelocked(ctx, recipient)
+		}
 		return whatsmeow.SendResponse{}, normalizeSendError(err)
 	}
 
@@ -115,12 +156,139 @@ func (service serviceSend) mergeReplyContext(ctx context.Context, contextInfo *w
 	return contextInfo
 }
 
+// Preflight answers "will a send to this number go through?" from local state
+// only — no stanza is sent to WhatsApp, so a panel can call it before every send
+// without costing the account anything. The decisive fact is whether this
+// session holds a trusted-contact token for the recipient; everything else is
+// context for why a send would be held back.
+func (service serviceSend) Preflight(ctx context.Context, request domainSend.PreflightRequest) (response domainSend.PreflightResponse, err error) {
+	client := whatsapp.ClientFromContext(ctx)
+	if client == nil {
+		return response, pkgError.ErrWaCLI
+	}
+
+	response.Sendable = true
+	deviceID := whatsapp.DeviceKeyFromContext(ctx)
+
+	// No phone: answer about the device alone. The account-wide timelock is a
+	// property of the account, not of any recipient, so it is knowable without
+	// one — the only question a caller holding no phone number can ask.
+	if strings.TrimSpace(request.Phone) == "" {
+		response.Scope = "device"
+		endsAt, active := service.activeAccountTimelock(ctx)
+		if !active {
+			response.Reason = "This account is not under a reach-out restriction. Whether any one contact can be messaged still depends on that contact; ask again with a phone to find out."
+			return response, nil
+		}
+		response.AccountTimelockEndsAt = &endsAt
+		response.Sendable = false
+		response.Reason = fmt.Sprintf("WhatsApp has restricted this account from starting new chats until %s. Until then, only contacts who have written to this session can be messaged.", endsAt.Format(time.RFC3339))
+		return response, nil
+	}
+
+	recipient, err := utils.ParseJID(request.Phone)
+	if err != nil {
+		return response, err
+	}
+
+	response.Scope = "recipient"
+	response.Phone = request.Phone
+	response.JID = recipient.String()
+
+	if tokenTime, warm := whatsapp.TrustedContactTokenTime(ctx, client, recipient); warm {
+		response.Warm = true
+		response.TokenReceivedAt = &tokenTime
+	}
+
+	// Groups, newsletters and status broadcasts are not reach-outs at all, so no
+	// restriction below applies to them.
+	if !whatsapp.IsColdReachoutTarget(recipient) {
+		response.Reason = "Not a one-to-one chat, so WhatsApp's restriction on starting new chats does not apply."
+		return response, nil
+	}
+
+	// The account-wide restriction is a fact about the account, not about this
+	// recipient, so it is always reported — a caller refreshing one contact also
+	// learns the account's state without a second request. It only makes a send
+	// unsendable for a cold recipient: a warm contact is reachable throughout.
+	//
+	// It is resolved before any per-recipient branch returns because when it is in
+	// force it is the root cause — every cold reach-out fails until it lifts,
+	// whichever number is tried — and a recipient-level cooldown would otherwise
+	// answer first and hide it.
+	var timelock string
+	if endsAt, active := service.activeAccountTimelock(ctx); active {
+		response.AccountTimelockEndsAt = &endsAt
+		if !response.Warm {
+			response.Sendable = false
+			timelock = fmt.Sprintf(" WhatsApp has also restricted this whole account from starting new chats until %s: until then no contact who has not written to this session can be reached, whichever number is tried.", endsAt.Format(time.RFC3339))
+		}
+	}
+
+	if remaining := whatsapp.ReachoutCooldownRemaining(ctx, recipient); remaining > 0 {
+		response.CooldownSeconds = int(remaining.Round(time.Second).Seconds())
+		response.Sendable = false
+		response.Reason = fmt.Sprintf("WhatsApp rejected a recent send to this number with error 463. Sends are held locally for another %s so the account does not keep retrying into the restriction.%s", remaining.Round(time.Second), timelock)
+		return response, nil
+	}
+
+	if response.Warm {
+		response.Reason = "This session holds a trusted-contact token for the recipient, so the send carries it and is not treated as starting a new chat."
+		if response.AccountTimelockEndsAt != nil {
+			response.Reason += " The account-wide restriction on starting new chats does not apply to a contact who has already written to this session."
+		}
+		return response, nil
+	}
+
+	if response.AccountTimelockEndsAt != nil {
+		response.Reason = fmt.Sprintf("WhatsApp has restricted this account from starting new chats until %s. Messaging a contact who has not written to this session will be rejected until then.", response.AccountTimelockEndsAt.Format(time.RFC3339))
+		return response, nil
+	}
+
+	if wait := whatsapp.ColdSendQueueDepth(deviceID); wait > 0 {
+		response.QueueWaitSeconds = int(wait.Round(time.Second).Seconds())
+		if wait > config.WhatsappColdSendMaxWait {
+			response.Sendable = false
+			response.Reason = fmt.Sprintf("No prior conversation with this number, and the pacing queue for new contacts is already %s deep. Retry later or spread the sends out.", wait.Round(time.Second))
+			return response, nil
+		}
+	}
+
+	response.Reason = "No prior conversation with this number. The send may still go through, but this is the case WhatsApp can reject with error 463. It becomes reliable once the recipient writes to this session, which is what delivers the trusted-contact token."
+	return response, nil
+}
+
+// activeAccountTimelock reads the persisted account-wide reach-out restriction
+// for the device in ctx. A lock whose end time has passed counts as over:
+// WhatsApp does not always send a follow-up event when it lifts one.
+func (service serviceSend) activeAccountTimelock(ctx context.Context) (endsAt time.Time, active bool) {
+	instance, ok := whatsapp.DeviceFromContext(ctx)
+	if !ok || instance == nil || service.chatStorageRepo == nil {
+		return time.Time{}, false
+	}
+	_, endsAtUnix, err := service.chatStorageRepo.GetReachoutTimelock(instance.ID())
+	if err != nil {
+		logrus.Warnf("Failed to read reach-out timelock for %s: %v", instance.ID(), err)
+		return time.Time{}, false
+	}
+	if endsAtUnix <= 0 {
+		return time.Time{}, false
+	}
+	endsAt = time.Unix(endsAtUnix, 0)
+	return endsAt, time.Now().Before(endsAt)
+}
+
 func normalizeSendError(err error) error {
 	if err == nil {
 		return nil
 	}
 	if whatsapp.IsReachoutTimelockError(err) {
 		return pkgError.ErrWaReachoutTimelock
+	}
+	// Any other numeric rejection is wrapped so the code reaches the caller as
+	// WA_SERVER_ERROR_<code> instead of being buried in a generic 500 body.
+	if code, ok := whatsapp.ServerErrorCode(err); ok {
+		return pkgError.WaServerError{Code: code, Err: err}
 	}
 	return err
 }

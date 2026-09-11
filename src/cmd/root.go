@@ -210,6 +210,16 @@ func initEnvConfig() {
 			config.WhatsappPresencePulseInterval = interval
 		}
 	}
+	if viper.IsSet("whatsapp_cold_send_interval") {
+		if interval := viper.GetDuration("whatsapp_cold_send_interval"); interval >= 0 {
+			config.WhatsappColdSendInterval = interval
+		}
+	}
+	if viper.IsSet("whatsapp_cold_send_max_wait") {
+		if maxWait := viper.GetDuration("whatsapp_cold_send_max_wait"); maxWait > 0 {
+			config.WhatsappColdSendMaxWait = maxWait
+		}
+	}
 	if viper.IsSet("whatsapp_presence_pulse_duration") {
 		if duration := viper.GetDuration("whatsapp_presence_pulse_duration"); duration > 0 {
 			config.WhatsappPresencePulseDuration = duration
@@ -506,6 +516,19 @@ func initFlags() {
 		"presence-pulse-duration", "",
 		config.WhatsappPresencePulseDuration,
 		`duration to stay available during a presence pulse --presence-pulse-duration <duration> | example: --presence-pulse-duration=5m`,
+	)
+
+	rootCmd.PersistentFlags().DurationVarP(
+		&config.WhatsappColdSendInterval,
+		"cold-send-interval", "",
+		config.WhatsappColdSendInterval,
+		`minimum spacing between sends to contacts with no existing conversation, to avoid error 463 --cold-send-interval <duration> | example: --cold-send-interval=10s (0 disables)`,
+	)
+	rootCmd.PersistentFlags().DurationVarP(
+		&config.WhatsappColdSendMaxWait,
+		"cold-send-max-wait", "",
+		config.WhatsappColdSendMaxWait,
+		`how long a request may wait for a cold-send slot before being rejected --cold-send-max-wait <duration> | example: --cold-send-max-wait=30s`,
 	)
 
 	// Chatwoot flags

@@ -25,7 +25,25 @@ func InitRestSend(app fiber.Router, service domainSend.ISendUsecase) Send {
 	app.Post("/send/poll", rest.SendPoll)
 	app.Post("/send/presence", rest.SendPresence)
 	app.Post("/send/chat-presence", rest.SendChatPresence)
+	app.Get("/send/preflight", rest.Preflight)
 	return rest
+}
+
+// Preflight reports whether a send to the given phone is expected to go through.
+// It reads local state only, so a caller may check before every send.
+func (controller *Send) Preflight(c fiber.Ctx) error {
+	request := domainSend.PreflightRequest{Phone: c.Query("phone")}
+	utils.SanitizePhone(&request.Phone)
+
+	response, err := controller.Service.Preflight(whatsapp.ContextWithDevice(c.Context(), getDeviceFromCtx(c)), request)
+	utils.PanicIfNeeded(err)
+
+	return c.JSON(utils.ResponseData{
+		Status:  200,
+		Code:    "SUCCESS",
+		Message: response.Reason,
+		Results: response,
+	})
 }
 
 func (controller *Send) SendText(c fiber.Ctx) error {

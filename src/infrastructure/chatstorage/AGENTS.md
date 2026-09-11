@@ -12,7 +12,7 @@ Generated: 2026-06-06
 |------|----------|-------|
 | Repository contract | `../../domains/chatstorage/interfaces.go` | Any method addition must be implemented here and in WhatsApp wrapper. |
 | SQL implementation | `sqlite_repository.go` | Single large repository file. |
-| Migrations | `sqlite_repository.go` `getMigrations()` | Append-only list, currently 29 migrations. |
+| Migrations | `sqlite_repository.go` `getMigrations()` | Append-only list, currently 45 migrations. |
 | Message edit history | `sqlite_repository.go`, `sqlite_repository_edit_test.go` | `message_edits` is append-only history while original message content updates. |
 | Chatwoot links | `sqlite_repository.go`, `../../domains/chatstorage/chatstorage.go` | Maps WhatsApp and Chatwoot IDs for idempotency, read/delete sync, and webhook routing. |
 | Chatwoot retry queue | `sqlite_repository.go` | Persists live forward retry jobs across restarts. |

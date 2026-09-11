@@ -81,6 +81,8 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 		handleNewsletterMuteChange(ctx, evt, instance.JID(), client)
 	case *events.CallOffer:
 		handleCallOffer(ctx, evt, chatStorageRepo, instance.JID(), client)
+	case *events.NotifyAccountReachoutTimelock:
+		handleReachoutTimelock(instance, evt)
 	}
 
 	instance.UpdateStateFromClient()
@@ -212,6 +214,46 @@ func handlePairPasskeyError(instance *DeviceInstance, evt *events.PairPasskeyErr
 		Result: map[string]any{
 			"device_id":    instance.ID(),
 			"continuation": evt.Continuation,
+		},
+	}
+}
+
+// handleReachoutTimelock surfaces WhatsApp's account-level reach-out
+// restriction. It arrives before most sends start failing with error 463, and
+// dropping it silently is why the first symptom users see is a wave of failed
+// sends (or a ban). Keep sending only inside conversations the contact started
+// until the enforcement window ends.
+func handleReachoutTimelock(instance *DeviceInstance, evt *events.NotifyAccountReachoutTimelock) {
+	endsAt := evt.TimeEnforcementEnds.Time
+
+	// Persisted rather than cached: the restriction outlives a gowa restart, and
+	// WhatsApp only announces it once, so a forgotten lock would read as "no
+	// restriction" until the next wave of rejected sends.
+	if repo := instance.GetChatStorage(); repo != nil {
+		endsAtUnix := int64(0)
+		if evt.IsActive && !endsAt.IsZero() {
+			endsAtUnix = endsAt.Unix()
+		}
+		enforcementType := ""
+		if evt.IsActive {
+			enforcementType = evt.EnforcementType
+		}
+		if err := repo.SaveReachoutTimelock(instance.ID(), enforcementType, endsAtUnix); err != nil {
+			logrus.Errorf("Failed to persist reach-out timelock for %s: %v", instance.ID(), err)
+		}
+	}
+
+	logrus.Warnf("[REACHOUT_TIMELOCK][%s] account restricted from starting new chats (active=%t, type=%q, ends=%s)",
+		instance.ID(), evt.IsActive, evt.EnforcementType, endsAt)
+
+	websocket.Broadcast <- websocket.BroadcastMessage{
+		Code:    "REACHOUT_TIMELOCK",
+		Message: "WhatsApp restricted this account from starting new chats (error 463). Avoid messaging new contacts until it clears.",
+		Result: map[string]any{
+			"device_id":        instance.ID(),
+			"is_active":        evt.IsActive,
+			"enforcement_type": evt.EnforcementType,
+			"ends_at":          endsAt,
 		},
 	}
 }

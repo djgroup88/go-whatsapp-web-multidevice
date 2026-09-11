@@ -37,6 +37,20 @@ func (r *deviceChatStorage) withDeviceChat(chat *domainChatStorage.Chat) *domain
 	return chat
 }
 
+func (r *deviceChatStorage) SaveReachoutTimelock(deviceID, enforcementType string, endsAtUnix int64) error {
+	if deviceID == "" {
+		deviceID = r.deviceID
+	}
+	return r.base.SaveReachoutTimelock(deviceID, enforcementType, endsAtUnix)
+}
+
+func (r *deviceChatStorage) GetReachoutTimelock(deviceID string) (string, int64, error) {
+	if deviceID == "" {
+		deviceID = r.deviceID
+	}
+	return r.base.GetReachoutTimelock(deviceID)
+}
+
 func (r *deviceChatStorage) CreateMessage(ctx context.Context, evt *events.Message) error {
 	return r.base.CreateMessage(ctx, evt)
 }
