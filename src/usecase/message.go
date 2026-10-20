@@ -275,8 +275,14 @@ func (service serviceMessage) DownloadMedia(ctx context.Context, request domainM
 		return response, err
 	}
 
-	// Query the message from chat storage
-	message, err := service.chatStorageRepo.GetMessageByID(request.MessageID)
+	deviceID := deviceIDFromContext(ctx)
+	if deviceID == "" {
+		return response, fmt.Errorf("device identification required")
+	}
+
+	// Message IDs are not globally unique across linked devices. The request's
+	// resolved device must scope lookup before chat/media validation.
+	message, err := service.chatStorageRepo.GetMessageByIDAndDevice(deviceID, request.MessageID)
 	if err != nil {
 		return response, fmt.Errorf("message not found: %v", err)
 	}
